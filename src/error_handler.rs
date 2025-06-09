@@ -1,71 +1,88 @@
 // OptiTask/backend-api/src/error_handler.rs
 use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, ResponseError};
-use diesel::result::Error as DieselError;
-use diesel_async::pooled_connection::PoolError;
-// The actual error type from your pool.get().await
-use diesel_async::pooled_connection::bb8::RunError as BB8RunError;
 use serde_json::json;
 use std::fmt;
+
+// Import spécifique pour les erreurs de pool diesel-async
+use diesel_async::pooled_connection::{bb8, PoolError};
 
 #[derive(Debug)]
 pub enum ServiceError {
     InternalServerError(String),
     BadRequest(String),
     Unauthorized(String),
-    DatabaseError(String), // Message déjà formaté
+    DatabaseError(String),
     NotFound(String),
-    PoolError(String), // Message déjà formaté
+    PoolError(String),
+    ValidationError(String),
+    ConflictError(String),
 }
 
 impl ServiceError {
-    fn from_diesel_error(error: DieselError) -> ServiceError {
+    fn from_pool_error(error: PoolError) -> ServiceError {
+        log::error!("Database pool error: {}", error);
+        ServiceError::PoolError("Database connection pool error.".to_string())
+    }
+}
+
+impl From<diesel::result::Error> for ServiceError {
+    fn from(error: diesel::result::Error) -> ServiceError {
         match error {
-            DieselError::DatabaseError(kind, info) => {
-                let detailed_message =
-                    format!("Database error: {:?} - Info: {}", kind, info.message());
-                log::error!("Internal Database Error: {}", detailed_message);
-                // Pour l'utilisateur, on peut être plus vague ou spécifique selon le cas
-                ServiceError::DatabaseError("A database operation failed.".to_string())
+            diesel::result::Error::NotFound => {
+                ServiceError::NotFound("The requested item was not found".to_string())
             }
-            DieselError::NotFound => {
-                ServiceError::NotFound("The requested record was not found.".to_string())
+            diesel::result::Error::DatabaseError(kind, info) => {
+                log::error!("Database error: {:?} - {}", kind, info.message());
+                ServiceError::DatabaseError("A database error occurred".to_string())
             }
-            err => {
-                log::error!("Unexpected Diesel error: {}", err);
-                ServiceError::DatabaseError("An unexpected database error occurred.".to_string())
+            _ => {
+                log::error!("Database operation error: {}", error);
+                ServiceError::DatabaseError(format!("Database operation failed: {}", error))
             }
         }
     }
+}
 
-    fn from_pool_error(error: PoolError) -> ServiceError {
-        log::error!("Pool error: {:?}", error);
-        ServiceError::PoolError("Could not connect to the database pool.".to_string())
-    }
-
-    fn from_bb8_run_error(error: BB8RunError) -> ServiceError {
-        log::error!("BB8 connection pool error: {:?}", error);
-        ServiceError::PoolError("Could not obtain connection from database pool.".to_string())
+impl From<bb8::RunError> for ServiceError {
+    fn from(error: bb8::RunError) -> ServiceError {
+        match error {
+            bb8::RunError::User(pool_error) => ServiceError::from(pool_error),
+            bb8::RunError::TimedOut => {
+                ServiceError::PoolError("Database connection timed out".to_string())
+            }
+        }
     }
 }
 
-impl From<DieselError> for ServiceError {
-    fn from(error: DieselError) -> ServiceError {
-        ServiceError::from_diesel_error(error)
-    }
-}
-
-// Implementation pour PoolError (quand on utilise pool.get().await)
+// Implémentation From pour les erreurs de pool
 impl From<PoolError> for ServiceError {
     fn from(error: PoolError) -> ServiceError {
         ServiceError::from_pool_error(error)
     }
 }
 
-// Add implementation for diesel-async bb8 RunError
-impl From<BB8RunError> for ServiceError {
-    fn from(error: BB8RunError) -> ServiceError {
-        ServiceError::from_bb8_run_error(error)
+// Ajout pour les erreurs de validation serde
+impl From<serde_json::Error> for ServiceError {
+    fn from(error: serde_json::Error) -> ServiceError {
+        log::error!("JSON serialization/deserialization error: {}", error);
+        ServiceError::BadRequest("Invalid JSON format.".to_string())
+    }
+}
+
+// Ajout pour les erreurs UUID
+impl From<uuid::Error> for ServiceError {
+    fn from(error: uuid::Error) -> ServiceError {
+        log::error!("UUID parsing error: {}", error);
+        ServiceError::BadRequest("Invalid UUID format.".to_string())
+    }
+}
+
+// Ajout pour les erreurs de parsing de nombres
+impl From<std::num::ParseIntError> for ServiceError {
+    fn from(error: std::num::ParseIntError) -> ServiceError {
+        log::error!("Number parsing error: {}", error);
+        ServiceError::BadRequest("Invalid number format.".to_string())
     }
 }
 
@@ -78,6 +95,8 @@ impl fmt::Display for ServiceError {
             ServiceError::DatabaseError(msg) => write!(f, "Database Error: {}", msg),
             ServiceError::NotFound(msg) => write!(f, "Not Found: {}", msg),
             ServiceError::PoolError(msg) => write!(f, "Pool Error: {}", msg),
+            ServiceError::ValidationError(msg) => write!(f, "Validation Error: {}", msg),
+            ServiceError::ConflictError(msg) => write!(f, "Conflict Error: {}", msg),
         }
     }
 }
@@ -89,41 +108,85 @@ impl ResponseError for ServiceError {
             ServiceError::DatabaseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServiceError::PoolError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServiceError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ServiceError::ValidationError(_) => StatusCode::BAD_REQUEST,
             ServiceError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServiceError::NotFound(_) => StatusCode::NOT_FOUND,
+            ServiceError::ConflictError(_) => StatusCode::CONFLICT,
         }
     }
 
     fn error_response(&self) -> HttpResponse {
         let status_code = self.status_code();
-        // Le log de l'erreur détaillée est maintenant dans les constructeurs from_diesel_error/from_bb8_error
-        // ou dans les handlers pour InternalServerError/BadRequest/Unauthorized s'ils sont créés manuellement.
-        // Ici, on logue juste le message qui sera envoyé à l'utilisateur, pour le contexte.
-        let user_facing_message = match status_code.as_u16() < 500 {
-            true => self.to_string(),
-            false => "An internal server error occurred. Please try again later.".to_string(),
+
+        // Message à envoyer au client
+        let user_message = match self {
+            // Pour les erreurs serveur, on envoie un message générique
+            ServiceError::InternalServerError(_)
+            | ServiceError::DatabaseError(_)
+            | ServiceError::PoolError(_) => {
+                "An internal server error occurred. Please try again later.".to_string()
+            }
+            // Pour les erreurs client, on peut être plus spécifique
+            _ => match self {
+                ServiceError::BadRequest(msg) => msg.clone(),
+                ServiceError::ValidationError(msg) => msg.clone(),
+                ServiceError::Unauthorized(msg) => msg.clone(),
+                ServiceError::NotFound(msg) => msg.clone(),
+                ServiceError::ConflictError(msg) => msg.clone(),
+                _ => "An error occurred.".to_string(),
+            },
         };
 
+        // Logging approprié selon le type d'erreur
         if status_code.is_server_error() {
-            // On pourrait logguer `self` ici si on veut la version formatée du Display
-            // mais les détails sont déjà loggués dans from_diesel_error ou from_bb8_error
-            log::error!(
-                "Responding with server error ({}): {}",
-                status_code,
-                user_facing_message
-            );
-        } else {
-            log::warn!(
-                "Responding with client error ({}): {}",
-                status_code,
-                user_facing_message
-            );
+            log::error!("Server error ({}): {}", status_code, self);
+        } else if status_code.is_client_error() {
+            log::warn!("Client error ({}): {}", status_code, self);
         }
 
-        HttpResponse::build(status_code).json(json!({
+        // Construction de la réponse JSON
+        let mut response_body = json!({
             "status": "error",
-            "statusCode": status_code.as_u16(),
-            "message": user_facing_message
-        }))
+            "code": status_code.as_u16(),
+            "message": user_message
+        });
+
+        // En mode debug, on peut ajouter plus de détails
+        #[cfg(debug_assertions)]
+        {
+            response_body["debug_info"] = json!({
+                "error_type": format!("{:?}", self),
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+        }
+
+        HttpResponse::build(status_code).json(response_body)
+    }
+}
+
+// Fonctions utilitaires pour créer des erreurs communes
+impl ServiceError {
+    pub fn bad_request<T: Into<String>>(msg: T) -> Self {
+        ServiceError::BadRequest(msg.into())
+    }
+
+    pub fn not_found<T: Into<String>>(msg: T) -> Self {
+        ServiceError::NotFound(msg.into())
+    }
+
+    pub fn unauthorized<T: Into<String>>(msg: T) -> Self {
+        ServiceError::Unauthorized(msg.into())
+    }
+
+    pub fn internal_error<T: Into<String>>(msg: T) -> Self {
+        ServiceError::InternalServerError(msg.into())
+    }
+
+    pub fn validation_error<T: Into<String>>(msg: T) -> Self {
+        ServiceError::ValidationError(msg.into())
+    }
+
+    pub fn conflict<T: Into<String>>(msg: T) -> Self {
+        ServiceError::ConflictError(msg.into())
     }
 }
